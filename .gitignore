@@ -1,6 +1,8 @@
+config.txt
+
+# Python compiled and cache
 *.pyc
+**/__pycache__/
+
 *~
 .DS_Store
-/test/data
-/test/logs
-/dist

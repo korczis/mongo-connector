@@ -1,0 +1,1 @@
+python %cd%\mongo_connector\connector.py -m localhost:27017 -n apollo.datasets -u _id -t http://apollocrawler.com:8983/solr/apollo -d %cd%\mongo_connector\doc_managers\solr_doc_manager.py 

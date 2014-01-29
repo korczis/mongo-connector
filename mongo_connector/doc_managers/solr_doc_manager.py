@@ -1,4 +1,4 @@
-# Copyright 2013-2014 MongoDB, Inc.
+# Copyright 2012 10gen, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This file will be used with PyPi in order to package and distribute the final
+# product.
+
 """Receives documents from the oplog worker threads and indexes them
 into the backend.
 
@@ -23,12 +26,16 @@ replace the method definitions with API calls for the desired backend.
 import re
 import json
 import logging
+import os
+import sys
 
-import bson.json_util as bsjson
 from pysolr import Solr, SolrError
 from threading import Timer
-from mongo_connector import errors
-from mongo_connector.util import retry_until_ok
+import collections
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'mongo_connector'))
+
+from util import retry_until_ok
 ADMIN_URL = 'admin/luke?show=Schema&wt=json'
 
 decoder = json.JSONDecoder()
@@ -42,7 +49,7 @@ class DocManager():
     multiple, slightly different versions of a doc.
     """
 
-    def __init__(self, url, auto_commit=False, unique_key='_id', **kwargs):
+    def __init__(self, url, auto_commit=False, unique_key='_id'):
         """Verify Solr URL and establish a connection.
         """
         self.solr = Solr(url)
@@ -51,6 +58,14 @@ class DocManager():
         self.field_list = []
         self.dynamic_field_list = []
         self.build_fields()
+
+        self.commit_bulk_max = 1000
+        self.commit_bulk_num = 0  
+
+        self.bulk_docs_send = 10   
+        self.bulk_docs_counter = 0
+
+        self.docs = []
 
         if auto_commit:
             self.run_auto_commit()
@@ -81,7 +96,6 @@ class DocManager():
             return doc
 
         fixed_doc = {}
-        doc[self.unique_key] = doc["_id"]
         for key, value in doc.items():
             if key in self.field_list[0]:
                 fixed_doc[key] = value
@@ -103,30 +117,100 @@ class DocManager():
         """
         self.auto_commit = False
 
+    def transform_doc_old(self, doc):
+        new_doc = dict()
+        new_doc['_id'] = doc['_id']
+        new_doc['GlossaryId'] = doc['GlossaryId']
+        new_doc['SourceTerm'] = doc['SourceTerm']
+
+        if 'Notes' in doc.keys(): 
+            new_doc['Notes'] = doc['Notes']     
+               
+        if 'Definition' in doc.keys():
+            new_doc['Definition'] = doc['Definition']
+
+        if 'IsProductName' in doc.keys():
+            new_doc['IsProductName'] = doc['IsProductName']
+
+        if 'DoNotTranslate' in doc.keys():
+            new_doc['DoNotTranslate'] = doc['DoNotTranslate']
+            
+
+        for translation in doc['TargetTerms']:
+            name = translation['LangCode'] + "_target_term"
+            name = re.sub('[^0-9a-zA-Z]+', '_', name).lower()
+            new_doc[name] = translation['Terms'][0]
+
+        # print(new_doc)
+        return new_doc
+
+    def transform_doc(self, doc):
+        new_doc = dict()
+        new_doc['_id'] = doc['_id']
+        new_doc['id'] = doc['_id']
+
+        if 'address' in doc['value']['data'].keys():
+            if 'street' in doc['value']['data']['address'].keys():
+                new_doc['cs_address_street'] = doc['value']['data']['address']['street']
+            
+            if 'city' in doc['value']['data']['address'].keys():
+                new_doc['cs_address_city'] = doc['value']['data']['address']['city']
+            
+            if 'postalCode' in doc['value']['data']['address'].keys():
+                new_doc['cs_address_postal_code'] = doc['value']['data']['address']['postalCode']
+
+        if 'description' in doc['value']['data'].keys():
+            new_doc['cs_description'] = doc['value']['data']['description']
+        
+        if 'email' in doc['value']['data'].keys():
+            new_doc['cs_email'] = doc['value']['data']['email']
+        
+        if 'fax' in doc['value']['data'].keys():
+            new_doc['fax'] = doc['value']['data']['fax']
+        
+        if 'name' in doc['value']['data'].keys():
+            new_doc['cs_name'] = doc['value']['data']['name']
+
+        if 'phone' in doc['value']['data'].keys():
+            new_doc['phone'] = doc['value']['data']['phone']
+
+        # print(new_doc)
+        return new_doc
+
     def upsert(self, doc):
         """Update or insert a document into Solr
 
         This method should call whatever add/insert/update method exists for
         the backend engine and add the document in there. The input will
         always be one mongo document, represented as a Python dictionary.
-        """
-        try:
-            self.solr.add([self.clean_doc(doc)], commit=True)
-        except SolrError:
-            raise errors.OperationFailed(
-                "Could not insert %r into Solr" % bsjson.dumps(doc))
+        """               
+        #docs = [self.clean_doc(self.transform_doc(doc))]
+        
+        doc = self.clean_doc(self.transform_doc(doc))
 
-    def bulk_upsert(self, docs):
-        """Update or insert multiple documents into Solr
+        self.docs.append(doc)
+        self.commit_bulk_num += 1
 
-        docs may be any iterable
-        """
-        try:
-            cleaned = (self.clean_doc(d) for d in docs)
-            self.solr.add(cleaned, commit=True)
-        except SolrError:
-            raise errors.OperationFailed(
-                "Could not bulk-insert documents into Solr")
+        if self.commit_bulk_num >= self.commit_bulk_max:            
+            self.commit()              
+
+    def sendDocsBulk(self):       
+
+        if self.docs:
+            #c = collections.Counter(self.docs)
+
+            try:
+                self.solr.add(self.docs, commit=True)
+                #retry_until_ok(self.solr.commit)
+                self.docs.clear()                
+                logging.info("Bulk add: (%s) ", self.commit_bulk_num)
+                self.commit_bulk_num = 0
+            except SolrError:
+                logging.error("Could not insert %r into Solr" % (self.docs))
+            except:
+                logging.error(sys.exc_info())
+                raise             
+
 
     def remove(self, doc):
         """Removes documents from Solr
@@ -155,7 +239,11 @@ class DocManager():
     def commit(self):
         """This function is used to force a commit.
         """
-        retry_until_ok(self.solr.commit)
+        #self.sendDocsBulk()
+        if self.docs:
+            self.sendDocsBulk()
+        #else:
+            #retry_until_ok(self.solr.commit)
 
     def run_auto_commit(self):
         """Periodically commits to the Solr server.

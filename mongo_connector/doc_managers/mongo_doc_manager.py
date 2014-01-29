@@ -1,4 +1,4 @@
-# Copyright 2013-2014 MongoDB, Inc.
+# Copyright 2012 10gen, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# This file will be used with PyPi in order to package and distribute the final
+# product.
 
 """Receives documents from the oplog worker threads and indexes them
     into the backend.
@@ -37,7 +40,7 @@ class DocManager():
         them as fields in the document, due to compatibility issues.
         """
 
-    def __init__(self, url, unique_key='_id', **kwargs):
+    def __init__(self, url, unique_key='_id'):
         """ Verify URL and establish a connection.
         """
         try:
@@ -47,26 +50,6 @@ class DocManager():
         except pymongo.errors.ConnectionFailure:
             raise errors.ConnectionFailed("Failed to connect to MongoDB")
         self.unique_key = unique_key
-        self.namespace_set = kwargs.get("namespace_set")
-
-    def _namespaces(self):
-        """Provides the list of namespaces being replicated to MongoDB
-        """
-        if self.namespace_set:
-            return self.namespace_set
-
-        user_namespaces = []
-        db_list = self.mongo.database_names()
-        for database in db_list:
-            if database == "config" or database == "local":
-                continue
-            coll_list = self.mongo[database].collection_names()
-            for coll in coll_list:
-                if coll.startswith("system"):
-                    continue
-                namespace = str(database) + "." + str(coll)
-                user_namespaces.append(namespace)
-        return user_namespaces
 
     def stop(self):
         """Stops any running threads
@@ -97,13 +80,27 @@ class DocManager():
     def search(self, start_ts, end_ts):
         """Called to query Mongo for documents in a time range.
         """
-        for namespace in self._namespaces():
+        search_set = []
+        db_list = self.mongo.database_names()
+        for database in db_list:
+            if database == "config" or database == "local":
+                continue
+            coll_list = self.mongo[database].collection_names()
+            for coll in coll_list:
+                if coll.startswith("system"):
+                    continue
+                namespace = str(database) + "." + str(coll)
+                search_set.append(namespace)
+
+        res = []
+        for namespace in search_set:
             database, coll = namespace.split('.', 1)
             target_coll = self.mongo[database][coll]
-            for document in target_coll.find({'_ts': {'$lte': end_ts,
-                                                      '$gte': start_ts}}):
-                yield document
+            res.extend(list(target_coll.find({'_ts': {'$lte': end_ts,
+                                                      '$gte': start_ts}})))
 
+        return res
+        
     def commit(self):
         """ Performs a commit
         """
@@ -112,14 +109,32 @@ class DocManager():
     def get_last_doc(self):
         """Returns the last document stored in Mongo.
         """
-        def docs_by_ts():
-            for namespace in self._namespaces():
-                database, coll = namespace.split('.', 1)
-                target_coll = self.mongo[database][coll]
-                for doc in target_coll.find(limit=1).sort('_ts', -1):
-                    yield doc
+        search_set = []
+        db_list = self.mongo.database_names()
+        for database in db_list:
+            if database == "config" or database == "local":
+                continue
+            coll_list = self.mongo[database].collection_names()
+            for coll in coll_list:
+                if coll.startswith("system"):
+                    continue
+                namespace = str(database) + "." + str(coll)
+                search_set.append(namespace)
 
-        return max(docs_by_ts(), key=lambda x:x["_ts"])
+        res = []
+        for namespace in search_set:
+            database, coll = namespace.split('.', 1)
+            target_coll = self.mongo[database][coll]
+            res.extend(list(target_coll.find().sort('_ts', -1)))
+
+        max_ts = 0
+        max_doc = None
+        for item in res:
+            if item['_ts'] > max_ts:
+                max_ts = item['_ts']
+                max_doc = item
+
+        return max_doc
 
     def _remove(self):
         """For test purposes only. Removes all documents in test.test
@@ -127,7 +142,7 @@ class DocManager():
         self.mongo['test']['test'].remove()
 
     def _search(self):
-        """For test purposes only. Performs search on MongoDB with empty query.
+        """For test purposes only. Performs search on Elastic with empty query.
         Does not have to be implemented.
         """
-        return self.mongo['test']['test'].find()
+        return list(self.mongo['test']['test'].find())
